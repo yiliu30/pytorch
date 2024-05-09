@@ -45,6 +45,7 @@ from torch.ao.quantization.quantizer.xnnpack_quantizer_utils import (
     OperatorConfig,
     OperatorPatternType,
     QuantizationConfig,
+    get_module_name_filter,
 )
 from torch.fx import Node
 from torch.fx.passes.utils.source_matcher_utils import (
@@ -292,10 +293,59 @@ def get_default_x86_inductor_quantization_config(
 def _get_supported_config_and_operators() -> List[OperatorConfig]:
     return _get_supported_x86_inductor_config_and_operators()
 
+AnnotatorType = Callable[
+    [
+        torch.fx.GraphModule,
+        Optional[QuantizationConfig],
+        Optional[Callable[[Node], bool]],
+    ],
+    Optional[List[List[Node]]],
+]
+_X86_OP_TO_ANNOTATOR: Dict[str, AnnotatorType] = {}
+
+def register_annotator(op: str):
+    def decorator(annotator: AnnotatorType):
+        _X86_OP_TO_ANNOTATOR[op] = annotator
+        return annotator
+
+    return decorator
+
 
 class X86InductorQuantizer(Quantizer):
     supported_config_and_operators = _get_supported_config_and_operators()
     module_function_to_aten_operator_type = _map_module_function_to_aten_operator_type()
+    
+    STATIC_QAT_ONLY_OPS = [
+        # "conv_bn_relu",
+        # "conv_bn",
+        # "conv_transpose_bn_relu",
+        # "conv_transpose_bn",
+    ]
+
+    # static quantization ops (both PTQ and QAT)
+    # Preserve the order that fusions come before singular ops
+    STATIC_OPS = [
+        "linear_unary",
+        "linear",
+        # "linear_relu",
+        # "linear",
+        # "conv_relu",
+        # "conv",
+        # "conv_transpose_relu",
+        # "adaptive_avg_pool2d",
+        # # TODO: move this to BoltNNQuantizer?
+        # "gru_io_only",
+        # "max_pool2d",
+        # "add_relu",
+        # "add",
+        # "mul_relu",
+        # "mul",
+        # "cat",
+    ]
+
+    DYNAMIC_OPS = [
+        # "linear",
+    ]
 
     def __init__(self):
         super().__init__()
@@ -303,6 +353,20 @@ class X86InductorQuantizer(Quantizer):
         self.operator_type_qconfig: Dict[
             torch._ops.OpOverloadPacket, Optional[QuantizationConfig]
         ] = {}
+        self.module_name_config: Dict[str, Optional[QuantizationConfig]] = {}
+
+    def set_module_name(
+        self, module_name: str, quantization_config: Optional[QuantizationConfig]
+    ):
+        """Set quantization_config for a submodule with name: `module_name`, for example:
+        quantizer.set_module_name("blocks.sub"), it will quantize all supported operator/operator
+        patterns in the submodule with this module name with the given `quantization_config`
+        """
+        assert (
+            quantization_config is not None
+        ), " quantization_config == None is not supported yet"
+        self.module_name_config[module_name] = quantization_config
+        return self
 
     @classmethod
     def get_supported_quantization_configs(cls) -> List[QuantizationConfig]:
@@ -507,7 +571,11 @@ class X86InductorQuantizer(Quantizer):
         if self.global_config and self.global_config.input_activation.is_dynamic:  # type: ignore[union-attr]
             model = self._annotate_for_dynamic_quantization_config(model)
         else:
-            model = self._annotate_for_static_quantization_config(model)
+            # 1) Annotate the model according to the `module_name_config`
+            model = self._annotate_static_quantization_config_by_module_name(model)
+            # 2) TODO: refine it, annotate the model according to the `operator_type_qconfig` and `operator_type_qconfig`
+            if self.operator_type_qconfig or self.global_config:
+                model = self._annotate_for_static_quantization_config(model)
         return model
 
     def _annotate_for_static_quantization_config(
@@ -1099,8 +1167,10 @@ class X86InductorQuantizer(Quantizer):
                 self._annotate_output_share_observer_as_input(input_node, node)
         return
 
+    @register_annotator("linear")
     def _annotate_linear(
-        self, gm: torch.fx.GraphModule, quantization_config: QuantizationConfig
+        self, gm: torch.fx.GraphModule, quantization_config: QuantizationConfig,
+        filter_fn: Optional[Callable[[Node], bool]] = None,
     ) -> None:
         linear_partitions = get_source_partitions(
             gm.graph, [torch.nn.Linear, torch.nn.functional.linear]
@@ -1121,10 +1191,14 @@ class X86InductorQuantizer(Quantizer):
             # skip annotation if it is already annotated
             if _is_annotated([linear_node]):
                 continue
+            if filter_fn and not filter_fn(linear_node):
+                continue 
             self._annotate_linear_node_helper(linear_node, True, quantization_config)
-
+    
+    @register_annotator("linear_unary")
     def _annotate_linear_unary(
-        self, gm: torch.fx.GraphModule, quantization_config: QuantizationConfig
+        self, gm: torch.fx.GraphModule, quantization_config: QuantizationConfig,
+        filter_fn: Optional[Callable[[Node], bool]] = None,
     ) -> None:
         postop_list = [
             torch.nn.ReLU,
@@ -1148,11 +1222,40 @@ class X86InductorQuantizer(Quantizer):
                 continue
             if _is_annotated([unary_node, linear_node]):
                 continue
+            if filter_fn and any(filter_fn(node) for node in [linear_node, unary_node]):
+                continue
             self._annotate_linear_node_helper(linear_node, False, quantization_config)
             unary_node.meta[QUANT_ANNOTATION_KEY] = _X86InductorQuantizationAnnotation(
                 _annotated=True,
                 _is_output_of_quantized_pattern=True,
             )
+
+    def _annotate_all_static_patterns(
+        self,
+        model: torch.fx.GraphModule,
+        quantization_config: Optional[QuantizationConfig],
+        filter_fn: Optional[Callable[[Node], bool]] = None,
+    ) -> torch.fx.GraphModule:
+        # TODO: implement the support for None to be canceling out previous annotations
+        if quantization_config is None:
+            return model
+
+        if quantization_config.is_qat:
+            for op in self.STATIC_QAT_ONLY_OPS:
+                _X86_OP_TO_ANNOTATOR[op](model, quantization_config, filter_fn) 
+        for op in self.STATIC_OPS:
+            _X86_OP_TO_ANNOTATOR[op](self, model, quantization_config, filter_fn)
+        return model
+
+    def _annotate_static_quantization_config_by_module_name(
+        self, model: torch.fx.GraphModule
+    ) -> torch.fx.GraphModule:
+        module_name_list = list(self.module_name_config.keys())
+        for module_name, config in self.module_name_config.items():
+            self._annotate_all_static_patterns(
+                model, config, get_module_name_filter(module_name)
+            )
+        return model
 
     def _annotate_linear_binary_unary(
         self,
