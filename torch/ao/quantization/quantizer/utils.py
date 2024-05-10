@@ -1,9 +1,13 @@
+import logging
 from typing import Callable, List, Optional
 
 from torch.ao.quantization.pt2e.utils import _is_sym_size_node
 
 from torch.ao.quantization.quantizer.quantizer import QuantizationAnnotation
 from torch.fx import Node
+
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.WARNING)
 
 
 def _annotate_input_qspec_map(node: Node, input_node: Node, qspec):
@@ -83,6 +87,39 @@ def _get_module_name_filter(module_name: str):
     return module_name_filter
 
 
+def _get_module_type_filter(tp: Callable):
+    """Get the module_type_filter function for a given module type, the filter accepts
+    a node and checks if the node comes from a module that has certain module type
+
+    For example:
+        node: linear_op = call_function[...](...)  # comes from a module with type Block -> Sub -> Linear
+
+
+    >> module_type_filter = _get_module_type_filter(Sub)  # submodule with type `Sub`, under the `Block` submodule
+    >> print(module_type_filter(node))
+    True  # the node is from the submodule `Sub` (same for `Block` and `Linear` as well)
+    """
+
+    tp_str = tp.__module__ + "." + tp.__qualname__
+
+    def module_type_filter(n: Node) -> bool:
+        # example: {
+        #     'L__self___sub': ("L['self'].sub", <class '....Sub'>),
+        #     'L__self___sub_linear': ("L['self'].sub.linear", <class 'torch.nn.modules.linear.Linear'>)
+        # }
+        nn_module_stack = n.meta.get("nn_module_stack", {})
+        types = []
+        for _, t in nn_module_stack.values():
+            # export() returns str, but older APIs (e.g. capture_pre_autograd_graph)
+            # return type. Handle both cases.
+            if isinstance(t, type):
+                t = t.__module__ + "." + t.__qualname__
+            types.append(t)
+        return tp_str in types
+
+    return module_type_filter
+
+
 def _is_annotated(nodes: List[Node]):
     """
     Given a list of nodes (that represents an operator pattern),
@@ -109,3 +146,30 @@ def _skip_annotate(
     if filter_fn and any(not filter_fn(node) for node in nodes):
         skip_annotate = True
     return skip_annotate
+
+
+import time
+
+
+def dump_elapsed_time(customized_msg=""):
+    """Get the elapsed time for decorated functions.
+
+    Args:
+        customized_msg (string, optional): The parameter passed to decorator. Defaults to None.
+    """
+
+    def f(func):
+        def fi(*args, **kwargs):
+            start = time.time()
+            res = func(*args, **kwargs)
+            end = time.time()
+            logger.info(
+                "%s elapsed time: %s ms",
+                customized_msg if customized_msg else func.__qualname__,
+                round((end - start) * 1000, 2),
+            )
+            return res
+
+        return fi
+
+    return f
