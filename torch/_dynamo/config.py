@@ -54,6 +54,11 @@ accumulated_cache_size_limit = 256
 # to be dynamic, but accesses to ints should NOT get promoted into inputs.
 specialize_int = False
 
+# Whether or not to specialize on float inputs.  Dynamo will always promote
+# float inputs into Tensor inputs, but at the moment, backends inconsistently
+# support codegen on float (this is to be fixed).
+specialize_float = True
+
 # legacy config, does nothing now!
 dynamic_shapes = True
 
@@ -216,7 +221,9 @@ capture_scalar_outputs = os.environ.get("TORCHDYNAMO_CAPTURE_SCALAR_OUTPUTS") ==
 # break instead of capturing.  This requires dynamic_shapes to be True.
 # If you set this to True, you probably also want capture_scalar_outputs
 # (these are separated for historical reasons).
-capture_dynamic_output_shape_ops = False
+capture_dynamic_output_shape_ops = (
+    os.environ.get("TORCHDYNAMO_CAPTURE_DYNAMIC_OUTPUT_SHAPE_OPS", "0") == "1"
+)
 
 # By default, dynamo will treat all ints as backed SymInts, which means (1) it
 # will wait to see the int change over multiple runs before generalizing and
@@ -232,7 +239,7 @@ force_unspec_int_unbacked_size_like_on_torchrec_kjt = False
 # false_fn produces code with identical guards.
 enforce_cond_guards_match = True
 
-# Specify how to optimize a compiiled DDP module. The flag accepts a bollean
+# Specify how to optimize a compiled DDP module. The flag accepts a boolean
 # value or a string. There are 4 modes.
 # 1. "ddp_optimizer" (or True): with "ddp_ptimizer", Dynamo will automatically
 # split model graph into pieces to match DDP bucket sizes to allow DDP

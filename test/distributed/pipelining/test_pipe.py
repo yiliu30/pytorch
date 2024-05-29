@@ -1,8 +1,15 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates
 # Owner(s): ["oncall: distributed"]
+from model_registry import MLPModule
+
 import torch
 from torch.distributed.pipelining import pipe_split, pipeline
-from torch.testing._internal.common_utils import run_tests, TestCase
+from torch.testing._internal.common_utils import (
+    instantiate_parametrized_tests,
+    parametrize,
+    run_tests,
+    TestCase,
+)
 
 
 d_hid = 512
@@ -15,19 +22,18 @@ torch.manual_seed(0)
 class ExampleCode(torch.nn.Module):
     def __init__(self):
         super().__init__()
-        self.mm_param0 = torch.nn.Parameter(torch.randn(d_hid, d_hid))
         self.mm_param1 = torch.nn.Parameter(torch.randn(d_hid, d_hid))
         self.mm_param2 = torch.nn.Parameter(torch.randn(d_hid, d_hid))
         self.lin1 = torch.nn.Linear(d_hid, d_hid)
         self.lin2 = torch.nn.Linear(d_hid, d_hid)
 
     def forward(self, x, y):
-        x = torch.mm(x, self.mm_param0)
+        x = torch.mm(x, self.mm_param1)  # mutli-use param
         skip_connection = x
         x = x + y
         x = torch.relu(x)
         pipe_split()
-        x = torch.mm(x, self.mm_param1)
+        x = torch.mm(x, self.mm_param1)  # mutli-use param
         x = self.lin1(x)
         pipe_split()
         x = torch.relu(x)
@@ -36,21 +42,6 @@ class ExampleCode(torch.nn.Module):
         pipe_split()
         x = self.lin2(x)
         x = torch.relu(x)
-        return x
-
-
-# MLP example
-class MLPModule(torch.nn.Module):
-    def __init__(self, d_hid):
-        super().__init__()
-        self.net1 = torch.nn.Linear(d_hid, d_hid)
-        self.relu = torch.nn.ReLU()
-        self.net2 = torch.nn.Linear(d_hid, d_hid)
-
-    def forward(self, x):
-        x = self.net1(x)
-        x = self.relu(x)
-        x = self.net2(x)
         return x
 
 
@@ -74,8 +65,9 @@ class MultiMLP(torch.nn.Module):
 
 
 class PipeTests(TestCase):
-    def _test_model_split(self, model_class):
-        mod = model_class()
+    @parametrize("ModelClass", [ExampleCode, MultiMLP])
+    def test_model_split(self, ModelClass):
+        mod = ModelClass()
         x = torch.randn(batch_size, d_hid)
         y = torch.randn(batch_size, d_hid)
 
@@ -108,12 +100,8 @@ class PipeTests(TestCase):
         """
         print("Qualname check passed")
 
-    def test_example_code(self):
-        self._test_model_split(ExampleCode)
 
-    def test_multi_mlp(self):
-        self._test_model_split(MultiMLP)
-
+instantiate_parametrized_tests(PipeTests)
 
 if __name__ == "__main__":
     run_tests()

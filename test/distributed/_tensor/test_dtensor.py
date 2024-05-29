@@ -1,9 +1,10 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates
 # Owner(s): ["oncall: distributed"]
 
+from numpy.testing import assert_array_equal
+
 import torch
 import torch.nn.functional as F
-from numpy.testing import assert_array_equal
 from torch.distributed._functional_collectives import AsyncCollectiveTensor
 
 from torch.distributed._tensor import (
@@ -819,7 +820,7 @@ class TestDTensorPlacementTypes(DTensorTestBase):
             )
             if size == 0:
                 # when tensor size is 0, there is no padding needed for all the ranks.
-                expected_pad_sizes = [0] * self.world_size
+                expected_pad_sizes = []
                 assert_array_equal(expected_pad_sizes, pad_sizes)
 
                 is_tensor_empty = [
