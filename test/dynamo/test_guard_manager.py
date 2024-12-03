@@ -1,5 +1,6 @@
 # Owner(s): ["module: dynamo"]
 import functools
+import unittest
 import weakref
 
 import torch
@@ -9,14 +10,15 @@ from torch._C._dynamo import guards
 from torch._dynamo.convert_frame import GlobalStateGuard
 from torch.testing._internal.common_utils import set_default_dtype
 
+
 RootGuardManager = guards.RootGuardManager
 DictGuardManager = guards.DictGuardManager
 DictSubclassGuardManager = guards.DictSubclassGuardManager
 GetAttrGuardAccessor = guards.GetAttrGuardAccessor
 GetItemGuardAccessor = guards.GetItemGuardAccessor
 TypeGuardAccessor = guards.TypeGuardAccessor
-TENSOR_ALIASING = guards.TENSOR_ALIASING
-install_tensor_aliasing_guard = guards.install_tensor_aliasing_guard
+OBJECT_ALIASING = guards.OBJECT_ALIASING
+install_object_aliasing_guard = guards.install_object_aliasing_guard
 NO_TENSOR_ALIASING = guards.NO_TENSOR_ALIASING
 install_no_tensor_aliasing_guard = guards.install_no_tensor_aliasing_guard
 
@@ -213,13 +215,13 @@ num_guards_executed=0)
 
     def test_no_hasattr_guard(self):
         class Bar:
-            def __init__(self):
+            def __init__(self) -> None:
                 self.bar = 2
 
         bar = Bar()
 
         class Foo:
-            def __init__(self):
+            def __init__(self) -> None:
                 self.foo = 2
 
         foo = Foo()
@@ -242,15 +244,15 @@ num_guards_executed=0)
 
         x_guard_mgr = guard_manager.getattr_manager("x", "", a, default_mgr_enum)
         y_guard_mgr = guard_manager.getattr_manager("y", "", a, default_mgr_enum)
-        install_tensor_aliasing_guard(x_guard_mgr, y_guard_mgr, ["x is y"])
+        install_object_aliasing_guard(x_guard_mgr, y_guard_mgr, ["x is y"])
 
         # Check structure
         x_guards = x_guard_mgr.get_leaf_guards()
         y_guards = y_guard_mgr.get_leaf_guards()
         self.assertEqual(len(x_guards), 1)
         self.assertEqual(len(y_guards), 1)
-        self.assertTrue(isinstance(x_guards[0], TENSOR_ALIASING))
-        self.assertTrue(isinstance(y_guards[0], TENSOR_ALIASING))
+        self.assertTrue(isinstance(x_guards[0], OBJECT_ALIASING))
+        self.assertTrue(isinstance(y_guards[0], OBJECT_ALIASING))
         # Check that the two guards are the same object
         self.assertTrue(x_guards[0] is y_guards[0])
 
@@ -371,6 +373,14 @@ num_guards_executed=0)
         self.assertTrue(guard(weakref_x()))
         del x
         self.assertFalse(guard(weakref_x()))
+
+    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    def test_call_function_no_args_guard(self):
+        x = torch.cuda.current_device()
+        guard = guards.EQUALS_MATCH(x, [0])
+        self.assertTrue(guard(0))
+        self.assertFalse(guard(1))
+        self.assertFalse(guard(2))
 
     def test_guard_manager_leaf_guard(self):
         guard_manager = RootGuardManager()
@@ -575,7 +585,7 @@ num_guards_executed=0)
         guard_manager = RootGuardManager()
         # Check a[3] which is tuple_iterator_getitem(foo, 2)
         guard_manager.add_tuple_iterator_length_guard(
-            5, id_type(iter(tuple())), ["len == 5"]
+            5, id_type(iter(())), ["len == 5"]
         )
         guard_manager.tuple_iterator_getitem_manager(
             2, "", foo, default_mgr_enum
@@ -732,6 +742,98 @@ num_guards_executed=0)
         f_locals["d"].pop(100)
         # fails because of len check
         self.assertFalse(root.check(f_locals))
+
+    def test_clone(self):
+        try:
+            from .utils import install_guard_manager_testing_hook
+        except ImportError:
+            from utils import install_guard_manager_testing_hook
+
+        def hook(guard_wrapper, f_locals):
+            root = guard_wrapper.root
+
+            # Check full cloning works as expected
+            cloned_root = root.clone_manager(lambda x: True)
+            self.assertTrue(cloned_root.check(f_locals))
+            f_locals["foo"] = [3, 4]
+            self.assertFalse(cloned_root.check(f_locals))
+            f_locals["foo"] = [2, 3]
+
+            # Skip guarding on foo
+            cloned_root = root.clone_manager(lambda x: "foo" not in x.get_source())
+            f_locals["foo"] = [3, 4]
+            # Original root should fail, but new root should pass because of
+            # absence of guards on foo.
+            self.assertFalse(root.check(f_locals))
+            self.assertTrue(cloned_root.check(f_locals))
+
+        class Bar:
+            x = 4
+            y = torch.randn(4)
+
+        foo = [2, 3]
+        bar = Bar()
+
+        def fn(x, foo, bar):
+            return x + foo[0] + bar.x * bar.y
+
+        x = torch.randn(4)
+        opt_fn = torch.compile(fn, backend="eager", fullgraph=True)
+        with install_guard_manager_testing_hook(hook):
+            opt_fn(x, foo, bar)
+
+    def test_diff_guard_manager(self):
+        try:
+            from .utils import install_guard_manager_testing_hook
+        except ImportError:
+            from utils import install_guard_manager_testing_hook
+        counter = 0
+
+        def hook(guard_wrapper, f_locals):
+            nonlocal counter
+            root = guard_wrapper.root
+            diff_guard_root = guard_wrapper.diff_guard_root
+
+            # Check full cloning works as expected
+            self.assertTrue(root.check(f_locals))
+            self.assertTrue(diff_guard_root.check(f_locals))
+
+            # Check that tensor guards run well
+            old_tensor = f_locals["bar"].y
+            f_locals["bar"].y = torch.randn(5)
+            self.assertFalse(root.check(f_locals))
+            self.assertFalse(diff_guard_root.check(f_locals))
+            f_locals["bar"].y = old_tensor
+
+            # Original root should fail on foo changes, but diff_guard_root
+            # should pass because it does not have foo guards on counter = 0. On
+            # counter = 1, it should pass because we have caused a recompile
+            # because of foo, causing it to recompile on foo.
+            f_locals["foo"] = [3, 3]
+            self.assertFalse(root.check(f_locals))
+            if counter == 0:
+                self.assertTrue(diff_guard_root.check(f_locals))
+            else:
+                self.assertFalse(diff_guard_root.check(f_locals))
+            counter += 1
+
+        class Bar:
+            x = 4
+            y = torch.randn(4)
+
+        bar = Bar()
+
+        def fn(x, foo, bar):
+            return x + foo[0] + bar.x * bar.y
+
+        x = torch.randn(4)
+        opt_fn = torch.compile(fn, backend="eager", fullgraph=True)
+        with install_guard_manager_testing_hook(hook):
+            foo = (12.0, 13)
+            opt_fn(x, foo, bar)
+
+            foo = (10.0, 11)
+            opt_fn(x, foo, bar)
 
 
 if __name__ == "__main__":

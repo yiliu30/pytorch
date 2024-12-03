@@ -1,3 +1,4 @@
+# mypy: allow-untyped-defs
 import getpass
 import inspect
 import os
@@ -8,10 +9,8 @@ from os.path import abspath, dirname
 from typing import Any, Callable, Dict, Optional, Set, Type, TYPE_CHECKING, Union
 
 import torch
-
-
-def is_fbcode():
-    return not hasattr(torch.version, "git_version")
+from torch._environment import is_fbcode
+from torch.utils._config_module import get_tristate_env, install_config_module
 
 
 # to configure logging for dynamo, aot, and inductor
@@ -33,7 +32,7 @@ verify_correctness = False
 # need this many ops to create an FX graph
 minimum_call_count = 1
 
-# turn on/off DCE pass
+# turn on/off DCE pass (deprecated: always true)
 dead_code_elimination = True
 
 # disable (for a function) when cache reaches this size
@@ -47,6 +46,15 @@ cache_size_limit = 8
 # [@compile_ignored: runtime_behaviour] safeguarding to prevent horrible recomps
 accumulated_cache_size_limit = 256
 
+# [@compile_ignored: runtime_behaviour] skip tracing recursively if cache limit is hit
+skip_code_recursive_on_cache_limit_hit = True
+
+# raise a hard error if cache limit is hit.  If you are on a model where you
+# know you've sized the cache correctly, this can help detect problems when
+# you regress guards/specialization.  This works best when cache_size_limit = 1.
+# [@compile_ignored: runtime_behaviour]
+fail_on_cache_limit_hit = False
+
 # whether or not to specialize on int inputs.  This only has an effect with
 # dynamic_shapes; when dynamic_shapes is False, we ALWAYS specialize on int
 # inputs.  Note that assume_static_by_default will also cause ints to get
@@ -57,7 +65,7 @@ specialize_int = False
 # Whether or not to specialize on float inputs.  Dynamo will always promote
 # float inputs into Tensor inputs, but at the moment, backends inconsistently
 # support codegen on float (this is to be fixed).
-specialize_float = True
+specialize_float = True if is_fbcode() else False
 
 # legacy config, does nothing now!
 dynamic_shapes = True
@@ -97,7 +105,7 @@ force_nn_module_property_static_shapes = True
 allow_ignore_mark_dynamic = False
 
 # Set this to False to assume nn.Modules() contents are immutable (similar assumption as freezing)
-guard_nn_modules = False if is_fbcode() else True
+guard_nn_modules = True
 
 # Uses CPython internal dictionary tags to detect mutation. There is some
 # overlap between guard_nn_modules_using_dict_tags and guard_nn_modules flag.
@@ -116,8 +124,9 @@ guard_nn_modules_using_dict_tags = True
 # This feature doesn't really work.  We offer this flag for experimental
 # purposes / if you want to help us build out support.
 #
-# torchdynamo has very limited support for tensor subclasses that implement
-# __torch_function__.  Our current support is limited to tensor subclasses
+# torchdynamo has limited support for tensor subclasses that implement
+# __torch_function__ see [Note: __torch_function__] in torch_function.py.
+# Our current support is limited to tensor subclasses
 # that DO NOT store metadata on the tensor (in general, dynamo does not
 # support Python code that stores extra attributes on tensors at present).
 # If your tensor subclass purely changes function call behavior via
@@ -225,6 +234,15 @@ capture_dynamic_output_shape_ops = (
     os.environ.get("TORCHDYNAMO_CAPTURE_DYNAMIC_OUTPUT_SHAPE_OPS", "0") == "1"
 )
 
+# hybrid backed unbacked symints
+prefer_deferred_runtime_asserts_over_guards = False
+
+# For complex dynamic shapes guards that we're unable to specify with dynamo/export's
+# range constraints + dims + derived dims language, we raise constraint violation
+# errors or specialize by default. If set to True, this flag avoids crashing/specialization,
+# and allows complex guards as runtime assertions in the graph.
+allow_complex_guards_as_runtime_asserts = False
+
 # By default, dynamo will treat all ints as backed SymInts, which means (1) it
 # will wait to see the int change over multiple runs before generalizing and
 # (2) it will still always 0/1 specialize an int.  When true, this knob
@@ -234,10 +252,6 @@ capture_dynamic_output_shape_ops = (
 # 0/1.  This is not on by default as AOTAutograd/Inductor cannot currently
 # compile this code; however, this can be useful for export.
 force_unspec_int_unbacked_size_like_on_torchrec_kjt = False
-
-# Should almost always be true in prod. This relaxes the requirement that cond's true_fn and
-# false_fn produces code with identical guards.
-enforce_cond_guards_match = True
 
 # Specify how to optimize a compiled DDP module. The flag accepts a boolean
 # value or a string. There are 4 modes.
@@ -293,21 +307,29 @@ def _get_optimize_ddp_mode():
     return mode
 
 
-# If True, delays DDPOptimizer submodule compilation to 1st run of the model,
-# so that real tensor strides are used in all submodules
-# (instead of using FakeTensor strides which can differ from real tensor strides and causes error in some cases).
-# This feature is not hardened yet and it's known to cause issues to some models, so False by default.
+# Skip tracing the torchrec files added to trace_rules.FBCODE_SKIP_DIRS
+skip_torchrec = True
+
+
+# No longer used
 optimize_ddp_lazy_compile = False
 
 # Whether to skip guarding on FSDP-managed modules
 skip_fsdp_guards = True
-# Whether to apply torch._dynamo.disable() to per-param FSDP hooks
-skip_fsdp_hooks = False
+# Whether to apply torch._dynamo.disable() to FSDP2 hooks.
+# Defaults to True. If Traceable FSDP2 is used, set this to False.
+skip_fsdp_hooks = True
 
 # Make dynamo skip guarding on hooks on nn modules
 # Note: unsafe: if your model actually has hooks and you remove them, or doesn't and  you add them,
 # dynamo will not notice and will execute whichever version you first compiled.
 skip_nnmodule_hook_guards = True
+
+# Make dynamo skip no tensor aliasing guard on parameters
+# Note: unsafe: if you compile a function with different parameters as inputs,
+# and then later pass on the same parameter as two inputs, dynamo will not
+# notice and lead to incorrect result.
+skip_no_tensor_aliasing_guards_on_parameters = True
 
 # If True, raises exception if TorchDynamo is called with a context manager
 raise_on_ctx_manager_usage = True
@@ -315,8 +337,7 @@ raise_on_ctx_manager_usage = True
 # If True, raise when aot autograd is unsafe to use
 raise_on_unsafe_aot_autograd = False
 
-# If true, error if you torch.jit.trace over a dynamo-optimized function.
-# If false, silently suppress dynamo
+# This flag is ignored and maintained for backwards compatibility.
 error_on_nested_jit_trace = True
 
 # If true, error with a better message if we symbolically trace over a
@@ -325,6 +346,12 @@ error_on_nested_fx_trace = True
 
 # Disables graph breaking on rnn. YMMV with backends.
 allow_rnn = False
+
+# If true, enables feature that captures PyTorch sparsity in the
+# exported FX graph. This flag should become the default eventually
+# and be removed, but currently provides a way to fall back to old
+# graph breaking behavior.
+capture_sparse_compute = False if is_fbcode() else True
 
 # If true, error if we try to compile a function that has
 # been seen before.
@@ -340,9 +367,6 @@ base_dir = dirname(dirname(dirname(abspath(__file__))))
 # Trace through NumPy or graphbreak
 trace_numpy = True
 
-# Trace through torch.distributed code
-trace_distributed = False
-
 # Default NumPy dtypes when tracing with torch.compile
 # We default to 64bits. For efficiency, one may want to change these to float32
 numpy_default_float = "float64"
@@ -352,13 +376,15 @@ numpy_default_int = "int64"
 # use numpy's PRNG if True, pytorch otherwise
 use_numpy_random_stream = False
 
-# Use C++ guard manager
-enable_cpp_guard_manager = os.environ.get("TORCHDYNAMO_CPP_GUARD_MANAGER", "1") == "1"
+# Use C++ guard manager (deprecated: always true)
+enable_cpp_guard_manager = True
 
 # Inline inbuilt nn modules
-inline_inbuilt_nn_modules = (
-    os.environ.get("TORCHDYNAMO_INLINE_INBUILT_NN_MODULES", "0") == "1"
-)
+inline_inbuilt_nn_modules = not is_fbcode()
+
+# When set, total compile time instruction count is recorded using
+# torch._dynamo.utilsCompileTimeInstructionCounter.
+record_compile_time_instruction_count = False
 
 
 def default_debug_dir_root():
@@ -401,9 +427,10 @@ cudagraph_backend_support_input_mutation = False
 # correctness of custom ops.
 only_allow_pt2_compliant_ops = False
 
-capture_autograd_function = True
+# This flag is ignored and maintained for backwards compatibility.
+capture_autograd_function = False
 
-# enable/disable dynamo tracing for `torch.func` transforms
+# This flag is ignored and maintained for backwards compatbility.
 capture_func_transforms = True
 
 # If to log Dynamo compilation metrics into log files (for OSS) and Scuba tables (for fbcode).
@@ -441,9 +468,56 @@ fake_tensor_cache_crosscheck_enabled = (
     os.environ.get("TORCH_FAKE_TENSOR_DISPATCH_CACHE_CROSSCHECK", "0") == "1"
 )
 
-# support `context_fn` in torch.utils.checkpoint.checkpoint API under torch.compile().
-# WARNING: this is an experimental flag and is subject to change.
-_experimental_support_context_fn_in_torch_utils_checkpoint = False
+# Enables the Compiled Autograd engine to trace .backward() calls made under torch.compile().
+# Note: AOT Autograd will still trace joint graphs.
+compiled_autograd = False
+
+# Overrides torch.compile() kwargs for Compiled Autograd:
+compiled_autograd_kwargs_override: Dict[str, Any] = {}
+
+# Enables use of collectives *during* compilation to synchronize behavior
+# across ranks.  Today, this is used solely to modify automatic_dynamic_shapes
+# behavior, making it so that we infer that if an input is dynamic by
+# inspecting whether or not its input size varies across ranks.  Because
+# this synchronization uses collectives, all ranks must run compilation at
+# the same time; ranks must not diverge with graph breaks.  This can be most
+# reliably achieved by ensuring PT2 only is run on SPMD programs.  If this
+# invariant is inviolated, you will likely deadlock NCCL and encounter a
+# NCCL timeout.
+enable_compiler_collectives = os.environ.get("TORCH_COMPILER_COLLECTIVES", "0") == "1"
+
+# Enables a local, filesystem "profile" which can be used for automatic
+# dynamic decisions, analogous to profile-guided optimization.  This config
+# ONLY has an effect if torch.compiler.config.workflow_id is specified,
+# which specifies the name of the profile we will save/load.
+#
+# The idea is that if we observe that a particular input is dynamic over
+# multiple iterations on one run, we can save a profile with this information
+# so the next time we run we can just make it dynamic the first time around,
+# skipping an unnecessary static compilation.  The profile can be soundly
+# stale, if it is wrong, it just means we may make more things dynamic than
+# was actually necessary (NB: this /can/ cause a failure if making something
+# dynamic causes the compiler to stop working because you tickled a latent
+# bug.)
+#
+# The profile is ONLY guaranteed to work if the user source code is 100%
+# unchanged.  Applying the profile if there are user code changes is only
+# best effort otherwise.  In particular, we identify particular code objects
+# by filename, line number and name of their function, so adding/removing newlines
+# will typically cause cache misses.  We continuously update the profile,
+# so if we only discover something is dynamic on the second run, we will update
+# the profile for subsequent runs.
+automatic_dynamic_local_pgo: bool = (
+    os.environ.get("TORCH_DYNAMO_AUTOMATIC_DYNAMIC_LOCAL_PGO", "0") == "1"
+)
+
+# Like above, but using remote cache
+automatic_dynamic_remote_pgo: Optional[bool] = get_tristate_env(
+    "TORCH_DYNAMO_AUTOMATIC_DYNAMIC_REMOTE_PGO"
+)
+
+# HACK: this is for testing custom ops profiling only
+_custom_ops_profile: Optional[Any] = None
 
 if TYPE_CHECKING:
     from torch.utils._config_typing import *  # noqa: F401, F403
@@ -451,7 +525,5 @@ if TYPE_CHECKING:
     def _make_closure_patcher(**changes):
         ...
 
-
-from torch.utils._config_module import install_config_module
 
 install_config_module(sys.modules[__name__])

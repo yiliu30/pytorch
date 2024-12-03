@@ -8,12 +8,14 @@
 
 namespace at {
 
+#ifndef STRIP_ERROR_MESSAGES
 // Returns "Tensor['N', 'C', 'H', 'W']" for a tensor with names ('N', 'C', 'H', 'W').
 static std::string toDimnameRepr(const Tensor& tensor) {
   std::ostringstream os;
   os << "Tensor" << tensor.names();
   return os.str();
 }
+#endif
 
 int64_t dimname_to_position(const Tensor& tensor, Dimname dim) {
   TORCH_CHECK(dim.type() != NameType::WILDCARD,
@@ -38,7 +40,7 @@ std::vector<int64_t> dimnames_to_positions(const Tensor& tensor, DimnameList dim
   return result;
 }
 
-static void report_positional_error(
+[[noreturn]] static void report_positional_error(
     const Dimname& name,
     const Dimname& other_name,
     DimnameList names,

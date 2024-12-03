@@ -20,11 +20,11 @@ from torch.onnx import (
     _OrtBackendOptions as OrtBackendOptions,
     ExportOptions,
 )
-
 from torch.testing._internal import common_utils
+from torch.testing._internal.common_utils import skipIfNNModuleInlined
+
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
 import onnx_test_common
 
 
@@ -51,17 +51,19 @@ class TestDynamoWithONNXRuntime(onnx_test_common._TestONNXRuntime):
         OrtBackend.clear_cached_instances()
 
     def test_get_ort_device_type(self):
+        from onnxruntime.capi import _pybind_state as ORTC
+
         self.assertEqual(
             torch.onnx._internal.onnxruntime._get_ort_device_type("cuda"),
-            torch.onnx._internal.onnxruntime.ORTC.OrtDevice.cuda(),
+            ORTC.OrtDevice.cuda(),
         )
         self.assertEqual(
             torch.onnx._internal.onnxruntime._get_ort_device_type("cpu"),
-            torch.onnx._internal.onnxruntime.ORTC.OrtDevice.cpu(),
+            ORTC.OrtDevice.cpu(),
         )
         self.assertEqual(
             torch.onnx._internal.onnxruntime._get_ort_device_type("maia"),
-            torch.onnx._internal.onnxruntime.ORTC.OrtDevice.npu(),
+            ORTC.OrtDevice.npu(),
         )
 
     def test_torch_compile_backend_registration(self):
@@ -109,15 +111,6 @@ class TestDynamoWithONNXRuntime(onnx_test_common._TestONNXRuntime):
                     export_options=ExportOptions(
                         dynamic_shapes=True,
                     )
-                ),
-            ),
-            (
-                OrtBackendOptions(
-                    use_aot_autograd=False,
-                    export_options=ExportOptions(
-                        op_level_debug=True,
-                        dynamic_shapes=True,
-                    ),
                 ),
             ),
         ]
@@ -353,7 +346,7 @@ class TestDynamoWithONNXRuntime(onnx_test_common._TestONNXRuntime):
         )
 
         class MLP(nn.Module):
-            def __init__(self):
+            def __init__(self) -> None:
                 super().__init__()
                 self.fc1 = nn.Linear(2, 4, bias=True)
                 self.fc2 = nn.Linear(4, 2, bias=True)
@@ -398,6 +391,7 @@ class TestDynamoWithONNXRuntime(onnx_test_common._TestONNXRuntime):
             (True, False),
         ]
     )
+    @skipIfNNModuleInlined("https://github.com/pytorch/pytorch/issues/129456")
     def test_llama_attention_with_local_backend(
         self, test_local_backend: bool, test_backward: bool
     ):
@@ -472,7 +466,8 @@ class TestDynamoWithONNXRuntime(onnx_test_common._TestONNXRuntime):
 
         if test_local_backend:
             assert local_ort is not None
-            number_of_captured_graphs = 3 if test_backward else 2
+            number_of_captured_graphs = 2 if test_backward else 1
+
             execution_count = len(example_args_collection) * number_of_captured_graphs
             self._assert_counting_information(
                 local_ort,
@@ -492,6 +487,7 @@ class TestDynamoWithONNXRuntime(onnx_test_common._TestONNXRuntime):
             (True, True),
         ]
     )
+    @skipIfNNModuleInlined("https://github.com/pytorch/pytorch/issues/129456")
     def test_llama_decoder_with_local_backend(
         self, test_local_backend: bool, test_backward: bool
     ):
@@ -565,8 +561,10 @@ class TestDynamoWithONNXRuntime(onnx_test_common._TestONNXRuntime):
 
         if test_local_backend:
             assert local_ort is not None
-            number_of_captured_graphs = 3 if test_backward else 2
+            number_of_captured_graphs = 2 if test_backward else 1
+
             execution_count = len(example_args_collection) * number_of_captured_graphs
+
             self._assert_counting_information(
                 local_ort,
                 expected_execution_count=execution_count,
@@ -582,6 +580,7 @@ class TestDynamoWithONNXRuntime(onnx_test_common._TestONNXRuntime):
             (True, True),
         ]
     )
+    @skipIfNNModuleInlined("https://github.com/pytorch/pytorch/issues/129456")
     def test_llama_with_local_backend(
         self, test_local_backend: bool, test_backward: bool
     ):
@@ -650,7 +649,7 @@ class TestDynamoWithONNXRuntime(onnx_test_common._TestONNXRuntime):
 
         if test_local_backend:
             assert local_ort is not None
-            number_of_captured_graphs = 3 if test_backward else 2
+            number_of_captured_graphs = 2 if test_backward else 1
             execution_count = len(example_args_collection) * number_of_captured_graphs
             self._assert_counting_information(
                 local_ort,
@@ -684,7 +683,7 @@ class TestDynamoWithONNXRuntime(onnx_test_common._TestONNXRuntime):
         )
 
         class MLP(nn.Module):
-            def __init__(self):
+            def __init__(self) -> None:
                 super().__init__()
                 self.fc1 = nn.Linear(2, 4, bias=True)
                 self.fc2 = nn.Linear(4, 2, bias=True)
@@ -782,8 +781,9 @@ class TestDynamoWithONNXRuntime(onnx_test_common._TestONNXRuntime):
         result = compiled_model()
 
         self.assertEqual(len(recorded_models), 1)
+        # NOTE: Constant folded by optimizer
         self.assertTrue(
-            "aten_add" in [node.op_type for node in recorded_models[0].graph.node]
+            "Constant" in [node.op_type for node in recorded_models[0].graph.node]
         )
 
         self.assertEqual(result, torch.ones(4, 8))
@@ -822,11 +822,11 @@ class TestDynamoWithONNXRuntime(onnx_test_common._TestONNXRuntime):
 
         # Part 2: Change the ONNX model seen by the transform so that
         # ORT receives a different model.
+        # NOTE: the function is optimized away by optimizer
         def replace_relu_with_sigmoid(onnx_model):
-            for function in onnx_model.functions:
-                for node in function.node:
-                    if node.op_type == "Relu":
-                        node.op_type = "Sigmoid"
+            for node in onnx_model.graph.node:
+                if node.op_type == "Relu":
+                    node.op_type = "Sigmoid"
 
         def another_example_model(x: torch.Tensor):
             y = torch.relu(x)

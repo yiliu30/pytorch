@@ -1,3 +1,4 @@
+# mypy: allow-untyped-decorators
 from typing import Callable, Iterable, Optional, Union
 from typing_extensions import deprecated
 
@@ -8,7 +9,6 @@ from torch.distributed._composable.contract import contract
 from torch.distributed._composable_state import _get_module_state, _insert_module_state
 from torch.distributed.fsdp._common_utils import _FSDPState
 from torch.distributed.fsdp._dynamo_utils import _annotate_modules_for_dynamo
-
 from torch.distributed.fsdp._init_utils import (
     _init_buffer_state,
     _init_core_state,
@@ -42,7 +42,8 @@ from torch.distributed.fsdp.wrap import _Policy
     "`torch.distributed._composable.fully_shard` is being deprecated. "
     "You can continue to use the wrapper based FSDP. "
     "See usage in: https://github.com/pytorch/pytorch/blob/main/torch/distributed/fsdp/fully_sharded_data_parallel.py. "
-    "`torch.distributed._composable.fully_shard` will be removed after PyTorch 2.5.",
+    "`torch.distributed._composable.fully_shard` will be removed after PyTorch 2.5. "
+    "If you are looking for FSDP2, please see `torch.distributed._composable.fsdp.fully_shard.`",
     category=FutureWarning,
 )
 def fully_shard(

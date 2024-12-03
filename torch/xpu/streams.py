@@ -1,9 +1,8 @@
+# mypy: allow-untyped-defs
 import ctypes
 
 import torch
-from torch._streambase import _EventBase, _StreamBase
-
-from .._utils import _dummy_type
+from torch._utils import _dummy_type
 
 
 if not hasattr(torch._C, "_XpuStreamBase"):
@@ -12,7 +11,7 @@ if not hasattr(torch._C, "_XpuStreamBase"):
     torch._C.__dict__["_XpuEventBase"] = _dummy_type("_XpuEventBase")
 
 
-class Stream(torch._C._XpuStreamBase, _StreamBase):
+class Stream(torch._C._XpuStreamBase):
     r"""Wrapper around a XPU stream.
 
     A XPU stream is a linear sequence of execution that belongs to a specific
@@ -97,7 +96,7 @@ class Stream(torch._C._XpuStreamBase, _StreamBase):
         return f"torch.xpu.Stream(device={self.device} sycl_queue={self.sycl_queue:#x})"
 
 
-class Event(torch._C._XpuEventBase, _EventBase):
+class Event(torch._C._XpuEventBase):
     r"""Wrapper around a XPU event.
 
     XPU events are synchronization markers that can be used to monitor the

@@ -20,7 +20,7 @@ class Block(torch.nn.Module):
         x = self.conv(x)
         x = self.lin0(x)
         pipe_split()
-        x.add_(constant)
+        x.add(constant)
         x = self.lin1(x)
         return self.relu(x)
 
@@ -48,7 +48,6 @@ class UnflattenTests(TestCase):
 
         pipe = pipeline(
             mod,
-            1,
             (x,),
             {"constant": constant},
         )

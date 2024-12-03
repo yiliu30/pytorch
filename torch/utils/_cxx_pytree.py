@@ -29,15 +29,11 @@ from typing import (
 )
 from typing_extensions import deprecated
 
-import torch
-
-if torch._running_with_deploy():  # type: ignore[no-untyped-call]
-    raise ImportError("C++ pytree utilities do not work with torch::deploy.")
-
 import optree
-from optree import PyTreeSpec  # direct import for type annotations
+from optree import PyTreeSpec as TreeSpec  # direct import for type annotations
 
-from torch.utils._pytree import KeyEntry
+import torch.utils._pytree as python_pytree
+from torch.utils._pytree import KeyEntry as KeyEntry
 
 
 __all__ = [
@@ -83,7 +79,6 @@ R = TypeVar("R")
 
 Context = Any
 PyTree = Any
-TreeSpec = PyTreeSpec
 FlattenFunc = Callable[[PyTree], Tuple[List[Any], Context]]
 UnflattenFunc = Callable[[Iterable[Any], Context], PyTree]
 OpTreeUnflattenFunc = Callable[[Context, Iterable[Any]], PyTree]
@@ -155,9 +150,7 @@ def register_pytree_node(
         from_dumpable_context=from_dumpable_context,
     )
 
-    from . import _pytree as python
-
-    python._private_register_pytree_node(
+    python_pytree._private_register_pytree_node(
         cls,
         flatten_fn,
         unflatten_fn,
@@ -247,6 +240,44 @@ def _private_register_pytree_node(
         )
 
 
+def tree_is_leaf(
+    tree: PyTree,
+    is_leaf: Optional[Callable[[PyTree], bool]] = None,
+) -> bool:
+    """Check if a pytree is a leaf.
+
+    >>> tree_is_leaf(1)
+    True
+    >>> tree_is_leaf(None)
+    True
+    >>> tree_is_leaf([1, 2, 3])
+    False
+    >>> tree_is_leaf((1, 2, 3), is_leaf=lambda x: isinstance(x, tuple))
+    True
+    >>> tree_is_leaf({'a': 1, 'b': 2, 'c': 3})
+    False
+    >>> tree_is_leaf({'a': 1, 'b': 2, 'c': None})
+    False
+
+    Args:
+        tree (pytree): A pytree to check if it is a leaf node.
+        is_leaf (callable, optional): An extra leaf predicate function that will be called at each
+            flattening step. The function should have a single argument with signature
+            ``is_leaf(node) -> bool``. If it returns :data:`True`, the whole subtree being treated
+            as a leaf. Otherwise, the default pytree registry will be used to determine a node is a
+            leaf or not. If the function is not specified, the default pytree registry will be used.
+
+    Returns:
+        A boolean indicating if the pytree is a leaf node.
+    """
+    return optree.tree_is_leaf(
+        tree,
+        is_leaf=is_leaf,
+        none_is_leaf=True,
+        namespace="torch",
+    )
+
+
 def tree_flatten(
     tree: PyTree,
     is_leaf: Optional[Callable[[PyTree], bool]] = None,
@@ -273,7 +304,7 @@ def tree_flatten(
     >>> from collections import OrderedDict
     >>> tree = OrderedDict([('b', (2, [3, 4])), ('a', 1), ('c', None), ('d', 5)])
     >>> tree_flatten(tree)
-    ([2, 3, 4, 1, None, 5], PyTreeSpec(OrderedDict([('b', (*, [*, *])), ('a', *), ('c', *), ('d', *)]), NoneIsLeaf))
+    ([2, 3, 4, 1, None, 5], PyTreeSpec(OrderedDict({'b': (*, [*, *]), 'a': *, 'c': *, 'd': *}), NoneIsLeaf))
 
     Args:
         tree (pytree): A pytree to flatten.
@@ -875,24 +906,19 @@ def treespec_dumps(treespec: TreeSpec, protocol: Optional[int] = None) -> str:
             f"treespec_dumps(spec): Expected `spec` to be instance of "
             f"TreeSpec but got item of type {type(treespec)}."
         )
-    from ._pytree import (
-        tree_structure as _tree_structure,
-        treespec_dumps as _treespec_dumps,
-    )
 
-    orig_treespec = _tree_structure(tree_unflatten([0] * treespec.num_leaves, treespec))
-    return _treespec_dumps(orig_treespec, protocol=protocol)
+    dummy_tree = tree_unflatten([0] * treespec.num_leaves, treespec)
+    orig_treespec = python_pytree.tree_structure(dummy_tree)
+    return python_pytree.treespec_dumps(orig_treespec, protocol=protocol)
 
 
 def treespec_loads(serialized: str) -> TreeSpec:
     """Deserialize a treespec from a JSON string."""
-    from ._pytree import (
-        tree_unflatten as _tree_unflatten,
-        treespec_loads as _treespec_loads,
+    orig_treespec = python_pytree.treespec_loads(serialized)
+    dummy_tree = python_pytree.tree_unflatten(
+        [0] * orig_treespec.num_leaves,
+        orig_treespec,
     )
-
-    orig_treespec = _treespec_loads(serialized)
-    dummy_tree = _tree_unflatten([0] * orig_treespec.num_leaves, orig_treespec)
     treespec = tree_structure(dummy_tree)
     return treespec
 
@@ -1004,3 +1030,12 @@ def keystr(kp: KeyPath) -> str:
 def key_get(obj: Any, kp: KeyPath) -> Any:
     """Given an object and a key path, return the value at the key path."""
     raise NotImplementedError("KeyPaths are not yet supported in cxx_pytree.")
+
+
+with python_pytree._NODE_REGISTRY_LOCK:
+    python_pytree._cxx_pytree_imported = True
+    args, kwargs = (), {}  # type: ignore[var-annotated]
+    for args, kwargs in python_pytree._cxx_pytree_pending_imports:
+        _private_register_pytree_node(*args, **kwargs)
+    python_pytree._cxx_pytree_pending_imports.clear()
+    del args, kwargs
