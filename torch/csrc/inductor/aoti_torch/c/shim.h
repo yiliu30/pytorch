@@ -44,11 +44,8 @@
 // to symbol clashes at link time if libtorch is included in a DLL and binary
 // that depends on the DLL. As a short term fix, we don't export the symbols.
 // In the long term, this will need to be addressed when Windows is supported.
-#ifdef EXPORT_AOTI_FUNCTIONS
-#define AOTI_TORCH_EXPORT __declspec(dllexport)
-#else
-#define AOTI_TORCH_EXPORT __declspec(dllimport)
-#endif
+// #define AOTI_TORCH_EXPORT __declspec(dllexport)
+#define AOTI_TORCH_EXPORT
 #else // !_WIN32
 #define AOTI_TORCH_EXPORT
 #endif // _WIN32
@@ -125,6 +122,11 @@ AOTI_TORCH_EXPORT int32_t aoti_torch_dtype_complex128();
 
 AOTI_TORCH_EXPORT int32_t aoti_torch_layout_strided();
 AOTI_TORCH_EXPORT int32_t aoti_torch_layout__mkldnn();
+
+AOTI_TORCH_EXPORT int32_t aoti_torch_memory_format_contiguous_format();
+AOTI_TORCH_EXPORT int32_t aoti_torch_memory_format_channels_last();
+AOTI_TORCH_EXPORT int32_t aoti_torch_memory_format_channels_last_3d();
+AOTI_TORCH_EXPORT int32_t aoti_torch_memory_format_preserve_format();
 
 // Functions for converting a single-element tensor to a scalar value
 AOTI_TORCH_EXPORT AOTITorchError
